@@ -1,0 +1,27 @@
+{
+  "name": "obsidian-downloader",
+  "version": "1.0.0",
+  "description": "Obsidian.md Distribution Downloader - Automated auth & download system",
+  "main": "download-flow.js",
+  "scripts": {
+    "auth": "node auth-setup.js",
+    "download": "node download-flow.js",
+    "test": "node login.js",
+    "check-session": "node check-session.js",
+    "start": "node index.js"
+  },
+  "keywords": [
+    "playwright",
+    "automation",
+    "obsidian",
+    "download",
+    "qa"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "playwright": "^1.40.0"
+  },
+  "type": "commonjs"
+}

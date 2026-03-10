@@ -1,0 +1,69 @@
+# Environment variables
+.env
+
+# Session state (contains auth cookies)
+auth.json
+
+# Screenshots and error captures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# Dependencies
+node_modules/
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# Downloaded files
+downloads/
+
+# Database (if not part of source control)
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE and Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
+
+# Build artifacts
+dist/
+build/
+
+# Test artifacts
+test-results/
+blob-report/
+playwright-report/
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# Misc
+$null
+Script.md
+Wall.md
