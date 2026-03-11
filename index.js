@@ -1,12 +1,19 @@
+require('dotenv').config();
+
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
+const { initDatabase, wasRecentlyDownloaded, logDownload, closeDatabase } = require('./database');
+const { notifySuccess, notifyAlreadyDownloaded, notifyError } = require('./notification');
 
 const AUTH_STATE_FILE = path.join(__dirname, 'auth.json');
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
 
 // Windows 10 User-Agent
 const WINDOWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+// Headless mode: default true, can be overridden with DEBUG=true in .env
+const isHeadless = process.env.DEBUG !== 'true';
 
 // ============================================================================
 // AUTHENTICATION MODULE
@@ -15,32 +22,49 @@ const WINDOWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 async function performLogin() {
     console.log('[AUTH] Starting authentication process...');
 
-    if (!process.env.LOGIN_USERNAME || !process.env.LOGIN_PASSWORD) {
+    if (!process.env.OBSIDIAN_EMAIL || !process.env.OBSIDIAN_PASSWORD) {
         throw new Error('[AUTH] Missing credentials in .env file');
     }
 
-    const browser = await chromium.launch({ headless: false });
-    const context = await browser.newContext();
+    const browser = await chromium.launch({
+        headless: isHeadless,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    const context = await browser.newContext({
+        viewport: { width: 1920, height: 1080 }
+    });
     const page = await context.newPage();
 
     try {
-        console.log('[AUTH] Navigating to login page...');
-        await page.goto('https://the-internet.herokuapp.com/login');
+        console.log('[AUTH] Navigating to https://obsidian.md/account');
+        await page.goto('https://obsidian.md/account', { waitUntil: 'networkidle' });
 
-        console.log('[AUTH] Entering credentials...');
-        await page.fill('#username', process.env.LOGIN_USERNAME);
-        await page.fill('#password', process.env.LOGIN_PASSWORD);
-        await page.click('button[type="submit"]');
+        const isLoggedIn = await page.$('text="Log out"');
+        if (isLoggedIn) {
+            console.log('[AUTH] Already logged in, saving session...');
+        } else {
+            console.log('[AUTH] Filling login form...');
 
-        console.log('[AUTH] Waiting for success message...');
-        await page.waitForSelector('#flash');
-        const flashMessage = await page.textContent('#flash');
+            const emailInput = page.locator('input[name="email"], input[type="email"], input[placeholder*="email" i], input[placeholder*="Email"]');
+            const passwordInput = page.locator('input[name="password"], input[type="password"], input[placeholder*="password" i]');
+            const submitButton = page.locator('button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), input[type="submit"], .login-button');
 
-        if (!flashMessage.includes('You logged into a secure area!')) {
-            throw new Error('[AUTH] Login failed. Got: ' + flashMessage);
+            await emailInput.first().waitFor({ state: 'visible', timeout: 10000 });
+            await passwordInput.first().waitFor({ state: 'visible', timeout: 10000 });
+
+            await emailInput.first().fill(process.env.OBSIDIAN_EMAIL);
+            await passwordInput.first().fill(process.env.OBSIDIAN_PASSWORD);
+
+            console.log('[AUTH] Submitting credentials...');
+            await submitButton.first().waitFor({ state: 'visible', timeout: 10000 });
+            await submitButton.first().click();
+
+            console.log('[AUTH] Waiting for successful authentication...');
+            await page.waitForSelector('text="Log out"', { timeout: 30000 });
+            console.log('[AUTH] Authentication successful!');
         }
 
-        console.log('[AUTH] Login successful, saving auth state...');
+        console.log('[AUTH] Saving auth state...');
         await context.storageState({ path: AUTH_STATE_FILE });
         console.log('[AUTH] Auth state saved to auth.json');
 
@@ -64,7 +88,7 @@ async function isSessionValid() {
     console.log('[SESSION] Checking if auth.json exists...');
 
     if (!fs.existsSync(AUTH_STATE_FILE)) {
-        console.log('[SESSION] auth.json not found');
+        console.log('[SESSION] auth.json not found - login required');
         return false;
     }
 
@@ -103,6 +127,9 @@ async function isSessionValid() {
 async function performDownload() {
     console.log('[DOWNLOAD] Starting download process...');
 
+    // Initialize database
+    initDatabase();
+
     if (!fs.existsSync(DOWNLOADS_DIR)) {
         fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
         console.log('[DOWNLOAD] Created downloads directory');
@@ -113,7 +140,7 @@ async function performDownload() {
     }
 
     const browser = await chromium.launch({
-        headless: false,
+        headless: isHeadless,
         args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
 
@@ -152,6 +179,19 @@ async function performDownload() {
         console.log('[DOWNLOAD] Waiting for download button...');
         await downloadLink.waitFor({ state: 'visible', timeout: 30000 });
 
+        // Get the expected filename before clicking
+        const href = await downloadLink.getAttribute('href');
+        const expectedFilename = href ? path.basename(href) : 'obsidian-setup.exe';
+
+        // Check if file was recently downloaded (24-hour protection)
+        if (wasRecentlyDownloaded(expectedFilename)) {
+            console.log(`[DOWNLOAD] SKIP: ${expectedFilename} was already downloaded successfully in the last 24 hours`);
+            await notifyAlreadyDownloaded(expectedFilename);
+            await browser.close();
+            closeDatabase();
+            return null;
+        }
+
         console.log('[DOWNLOAD] Initiating download...');
 
         const [download] = await Promise.all([
@@ -168,15 +208,32 @@ async function performDownload() {
         console.log('[DOWNLOAD] Download completed successfully!');
         console.log(`[DOWNLOAD] File saved: ${savePath}`);
 
+        // Log successful download
+        logDownload(suggestedFilename, 'success');
+
+        // Send Telegram notification
+        await notifySuccess(suggestedFilename);
+
         return savePath;
     } catch (error) {
         console.error('[DOWNLOAD] Error:', error.message);
+        
+        // Log failed download
+        try {
+            const href = await downloadLink.getAttribute('href');
+            const failedFilename = href ? path.basename(href) : 'unknown';
+            logDownload(failedFilename, 'failed');
+        } catch (e) {
+            logDownload('unknown', 'failed');
+        }
+        
         const screenshotPath = path.join(__dirname, 'error-debug.png');
         await page.screenshot({ path: screenshotPath, fullPage: true });
         console.error(`[DOWNLOAD] Screenshot saved to ${screenshotPath}`);
         throw error;
     } finally {
         await browser.close();
+        closeDatabase();
     }
 }
 
@@ -215,6 +272,10 @@ async function main() {
         console.error('FLOW FAILED');
         console.error('Error:', error.message);
         console.error('='.repeat(60));
+
+        // Send error notification
+        await notifyError(error.message);
+
         process.exit(1);
     }
 }

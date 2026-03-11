@@ -1,6 +1,10 @@
+require('dotenv').config();
+
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
+const { initDatabase, wasRecentlyDownloaded, logDownload, closeDatabase } = require('./database');
+const { notifySuccess, notifyAlreadyDownloaded, notifyError } = require('./notification');
 
 const AUTH_STATE_FILE = path.join(__dirname, 'auth.json');
 const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
@@ -11,6 +15,9 @@ const WINDOWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 async function downloadFlow() {
     console.log('[DOWNLOAD FLOW] Starting download process...');
 
+    // Initialize database
+    initDatabase();
+
     // Ensure downloads directory exists
     if (!fs.existsSync(DOWNLOADS_DIR)) {
         fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
@@ -19,7 +26,8 @@ async function downloadFlow() {
 
     // Check if auth file exists
     if (!fs.existsSync(AUTH_STATE_FILE)) {
-        console.error('[DOWNLOAD FLOW] Session expired. Run auth-setup.js first.');
+        console.error('[DOWNLOAD FLOW] Session expired. Run npm start first to authenticate.');
+        closeDatabase();
         process.exit(1);
     }
 
@@ -47,7 +55,7 @@ async function downloadFlow() {
         // Check if session is valid (not redirected to login)
         const currentUrl = page.url();
         if (currentUrl.includes('/login') || currentUrl.includes('/auth')) {
-            console.error('[DOWNLOAD FLOW] Session expired. Run auth-setup.js first.');
+            console.error('[DOWNLOAD FLOW] Session expired. Run npm start first to re-authenticate.');
             process.exit(1);
         }
 
@@ -76,7 +84,27 @@ async function downloadFlow() {
         // Wait for download link to be visible
         console.log('[DOWNLOAD FLOW] Waiting for download button to be visible...');
         await downloadLink.waitFor({ state: 'visible', timeout: 30000 });
-        
+
+        // Get the expected filename before clicking
+        const href = await downloadLink.getAttribute('href');
+        const expectedFilename = href ? path.basename(href) : 'obsidian-setup.exe';
+
+        // Check if file was recently downloaded (24-hour protection)
+        if (wasRecentlyDownloaded(expectedFilename)) {
+            const filePath = path.join(DOWNLOADS_DIR, expectedFilename);
+            const fileExists = fs.existsSync(filePath);
+            
+            if (fileExists) {
+                console.log(`[DOWNLOAD FLOW] SKIP: ${expectedFilename} was already downloaded successfully in the last 24 hours`);
+                await notifyAlreadyDownloaded(expectedFilename);
+                await browser.close();
+                closeDatabase();
+                return;
+            } else {
+                console.log(`[DOWNLOAD FLOW] DB record exists but file missing: ${expectedFilename}. Proceeding with download...`);
+            }
+        }
+
         console.log('[DOWNLOAD FLOW] Initiating download...');
         
         const [download] = await Promise.all([
@@ -94,21 +122,40 @@ async function downloadFlow() {
 
         // Save the download
         await download.saveAs(savePath);
-        
+
         console.log('[DOWNLOAD FLOW] Download completed successfully!');
         console.log(`[DOWNLOAD FLOW] File saved: ${savePath}`);
 
+        // Log successful download
+        logDownload(suggestedFilename, 'success');
+
+        // Send Telegram notification
+        await notifySuccess(suggestedFilename);
+
     } catch (error) {
         console.error('[DOWNLOAD FLOW] Error:', error.message);
-        
+
+        // Log failed download (try to get filename from error context)
+        try {
+            const href = await downloadLink.getAttribute('href');
+            const failedFilename = href ? path.basename(href) : 'unknown';
+            logDownload(failedFilename, 'failed');
+        } catch (e) {
+            logDownload('unknown', 'failed');
+        }
+
+        // Send Telegram notification
+        await notifyError(error.message);
+
         // Take screenshot on error
         const screenshotPath = path.join(__dirname, 'error-debug.png');
         await page.screenshot({ path: screenshotPath, fullPage: true });
         console.error(`[DOWNLOAD FLOW] Screenshot saved to ${screenshotPath}`);
-        
+
         throw error;
     } finally {
         await browser.close();
+        closeDatabase();
     }
 }
 
