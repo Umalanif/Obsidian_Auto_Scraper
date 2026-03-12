@@ -27,6 +27,7 @@ function initDatabase() {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filename TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
+            timestamp_text TEXT NOT NULL,
             status TEXT NOT NULL CHECK(status IN ('success', 'failed'))
         )
     `);
@@ -38,9 +39,22 @@ function initDatabase() {
     } catch (e) {
         // Column already exists, ignore
     }
-    
+
     try {
         db.exec(`ALTER TABLE downloads ADD COLUMN file_size INTEGER DEFAULT 0`);
+    } catch (e) {
+        // Column already exists, ignore
+    }
+
+    // Add timestamp_text column for human-readable timestamps (migration)
+    try {
+        db.exec(`ALTER TABLE downloads ADD COLUMN timestamp_text TEXT`);
+        // Backfill existing records with formatted timestamp
+        db.exec(`
+            UPDATE downloads 
+            SET timestamp_text = datetime(timestamp / 1000, 'unixepoch', 'localtime')
+            WHERE timestamp_text IS NULL
+        `);
     } catch (e) {
         // Column already exists, ignore
     }
@@ -50,12 +64,29 @@ function initDatabase() {
         CREATE TABLE IF NOT EXISTS download_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             session_start INTEGER NOT NULL,
+            session_start_text TEXT,
             session_end INTEGER,
+            session_end_text TEXT,
             total_downloads INTEGER DEFAULT 0,
             total_bytes INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active' CHECK(status IN ('active', 'completed', 'failed'))
         )
     `);
+
+    // Add timestamp_text columns for human-readable timestamps (migration)
+    try {
+        db.exec(`ALTER TABLE download_sessions ADD COLUMN session_start_text TEXT`);
+        db.exec(`ALTER TABLE download_sessions ADD COLUMN session_end_text TEXT`);
+        // Backfill existing records with formatted timestamps
+        db.exec(`
+            UPDATE download_sessions 
+            SET session_start_text = datetime(session_start / 1000, 'unixepoch', 'localtime'),
+                session_end_text = datetime(session_end / 1000, 'unixepoch', 'localtime')
+            WHERE session_start_text IS NULL AND session_start IS NOT NULL
+        `);
+    } catch (e) {
+        // Columns already exist, ignore
+    }
 
     // Create index for faster lookups
     db.exec(`
@@ -107,15 +138,18 @@ function wasRecentlyDownloaded(filename) {
 function logDownload(filename, status, sessionId = null, fileSize = 0) {
     const database = initDatabase();
 
+    const now = Date.now();
+    const timestampText = new Date(now).toISOString().replace('T', ' ').substring(0, 19);
+
     const stmt = database.prepare(`
-        INSERT INTO downloads (filename, timestamp, status, session_start, file_size)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO downloads (filename, timestamp, timestamp_text, status, session_start, file_size)
+        VALUES (?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(filename, Date.now(), status, sessionId, fileSize);
+    stmt.run(filename, now, timestampText, status, sessionId, fileSize);
 
     logger.info(`Logged download: ${filename} - ${status} (${fileSize} bytes)`, { module: 'DATABASE' });
-    
+
     // Update session stats if sessionId provided
     if (sessionId && status === 'success') {
         updateSessionStats(sessionId, fileSize);
@@ -129,12 +163,15 @@ function logDownload(filename, status, sessionId = null, fileSize = 0) {
 function startSession() {
     const database = initDatabase();
 
+    const now = Date.now();
+    const timestampText = new Date(now).toISOString().replace('T', ' ').substring(0, 19);
+
     const stmt = database.prepare(`
-        INSERT INTO download_sessions (session_start, status)
-        VALUES (?, 'active')
+        INSERT INTO download_sessions (session_start, session_start_text, status)
+        VALUES (?, ?, 'active')
     `);
 
-    const result = stmt.run(Date.now());
+    const result = stmt.run(now, timestampText);
     logger.info(`Started audit session: ${result.lastInsertRowid}`, { module: 'DATABASE' });
     return result.lastInsertRowid;
 }
@@ -147,13 +184,16 @@ function startSession() {
 function endSession(sessionId, status = 'completed') {
     const database = initDatabase();
 
+    const now = Date.now();
+    const timestampText = new Date(now).toISOString().replace('T', ' ').substring(0, 19);
+
     const stmt = database.prepare(`
         UPDATE download_sessions
-        SET session_end = ?, status = ?
+        SET session_end = ?, session_end_text = ?, status = ?
         WHERE id = ?
     `);
 
-    stmt.run(Date.now(), status, sessionId);
+    stmt.run(now, timestampText, status, sessionId);
     logger.info(`Ended audit session: ${sessionId} - ${status}`, { module: 'DATABASE' });
 }
 
@@ -216,14 +256,14 @@ function getRecentSessions() {
  */
 function getDownloadHistory(filename) {
     const database = initDatabase();
-    
+
     const stmt = database.prepare(`
-        SELECT id, filename, timestamp, status
+        SELECT id, filename, timestamp, timestamp_text, status
         FROM downloads
         WHERE filename = ?
         ORDER BY timestamp DESC
     `);
-    
+
     return stmt.all(filename);
 }
 
@@ -233,16 +273,16 @@ function getDownloadHistory(filename) {
  */
 function getRecentDownloads() {
     const database = initDatabase();
-    
+
     const twentyFourHoursAgo = Date.now() - (24 * 60 * 60 * 1000);
-    
+
     const stmt = database.prepare(`
-        SELECT id, filename, timestamp, status
+        SELECT id, filename, timestamp, timestamp_text, status
         FROM downloads
         WHERE timestamp > ?
         ORDER BY timestamp DESC
     `);
-    
+
     return stmt.all(twentyFourHoursAgo);
 }
 
