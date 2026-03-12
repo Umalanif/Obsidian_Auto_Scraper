@@ -23,8 +23,8 @@ OBSIDIAN_PASSWORD=your-password
 ### 2. Telegram Notifications (Optional)
 
 ```env
-TELEGRAM_USER_ID=7865462329
-TELEGRAM_BOT_TOKEN=8600722199:AAHPjlz5uvD_-sm8zbhGyboYy_cgkA59U9Y
+TELEGRAM_USER_ID=
+TELEGRAM_BOT_TOKEN=
 ```
 
 ### 3. Paths Configuration
@@ -46,6 +46,7 @@ LOG_FILE=./app.log
 ```
 
 **Example for different computer:**
+
 ```env
 AUTH_STATE_FILE=C:\Users\YourName\AppData\Obsidian\auth.json
 DOWNLOADS_DIR=D:\Downloads\Obsidian
@@ -74,6 +75,7 @@ CRON_SCHEDULE=0 */6 * * *
 ```
 
 **Common schedules:**
+
 - `0 9 * * *` - Every day at 9 AM
 - `0 */4 * * *` - Every 4 hours
 - `0 0 * * 1` - Every Monday at midnight
@@ -159,6 +161,7 @@ DOWNLOAD_SKIP_HOURS=24
 ### No Code Changes Required
 
 All configuration is now in `.env`. You never need to modify JavaScript files for:
+
 - Different file paths
 - Different schedules
 - Different timeout values
