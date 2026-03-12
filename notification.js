@@ -1,4 +1,17 @@
 const https = require('https');
+const { retryWithBackoff, retryHttpsRequest } = require('./retry-utils');
+const { createLogger } = require('./logger');
+
+const logger = createLogger('TELEGRAM');
+
+// Retry configuration for notifications (shorter delays for better UX)
+const NOTIFICATION_RETRY_CONFIG = {
+    maxRetries: 3,
+    baseDelay: 500,
+    maxDelay: 10000,
+    exponentialFactor: 2,
+    jitter: true,
+};
 
 /**
  * Send a message to Telegram
@@ -10,48 +23,39 @@ async function sendTelegramMessage(message) {
     const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
     if (!TELEGRAM_USER_ID || !TELEGRAM_BOT_TOKEN) {
-        console.warn('[TELEGRAM] Credentials not configured. Skipping notification.');
+        logger.warn('Telegram credentials not configured. Skipping notification.');
         return false;
     }
 
     const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-    
+
     const postData = JSON.stringify({
         chat_id: TELEGRAM_USER_ID,
         text: message,
         parse_mode: 'HTML'
     });
 
-    return new Promise((resolve, reject) => {
-        const req = https.request(url, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Content-Length': Buffer.byteLength(postData)
-            }
-        }, (res) => {
-            let data = '';
-            res.on('data', (chunk) => { data += chunk; });
-            res.on('end', () => {
-                const response = JSON.parse(data);
-                if (response.ok) {
-                    console.log('[TELEGRAM] Message sent successfully');
-                    resolve(true);
-                } else {
-                    console.error('[TELEGRAM] API error:', response.description);
-                    resolve(false);
-                }
-            });
-        });
+    try {
+        const response = await retryHttpsRequest(
+            {
+                url: url,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(postData)
+                },
+                operationName: 'Telegram notification'
+            },
+            postData,
+            NOTIFICATION_RETRY_CONFIG
+        );
 
-        req.on('error', (e) => {
-            console.error('[TELEGRAM] Request error:', e.message);
-            reject(e);
-        });
-
-        req.write(postData);
-        req.end();
-    });
+        logger.info('Message sent successfully');
+        return true;
+    } catch (error) {
+        logger.error(`Failed to send message after retries: ${error.message}`);
+        return false;
+    }
 }
 
 /**
@@ -61,7 +65,7 @@ async function sendTelegramMessage(message) {
  */
 async function notifySuccess(filename) {
     const message = `✅ Файл <b>${escapeHtml(filename)}</b> успешно скачан и сохранен.`;
-    console.log(`[TELEGRAM] Sending success notification...`);
+    logger.info('Sending success notification...');
     return sendTelegramMessage(message);
 }
 
@@ -72,7 +76,7 @@ async function notifySuccess(filename) {
  */
 async function notifyAlreadyDownloaded(filename) {
     const message = `ℹ️ Файл <b>${escapeHtml(filename)}</b> was already downloaded successfully in the last 24 hours`;
-    console.log(`[TELEGRAM] Sending already downloaded notification...`);
+    logger.info('Sending already downloaded notification...');
     return sendTelegramMessage(message);
 }
 
@@ -83,7 +87,22 @@ async function notifyAlreadyDownloaded(filename) {
  */
 async function notifyError(errorText) {
     const message = `❌ Ошибка при автоматизации: <b>${escapeHtml(errorText)}</b>`;
-    console.log(`[TELEGRAM] Sending error notification...`);
+    logger.info('Sending error notification...');
+    return sendTelegramMessage(message);
+}
+
+/**
+ * Send critical error notification (global handler)
+ * @param {string} errorText - Error message
+ * @param {string} stack - Error stack trace
+ * @returns {Promise<boolean>}
+ */
+async function notifyCriticalError(errorText, stack) {
+    const message = `🚨 <b>CRITICAL ERROR</b>\n\n` +
+        `❌ <b>Error:</b> ${escapeHtml(errorText)}\n\n` +
+        `📋 <b>Stack trace:</b>\n<code>${escapeHtml(stack || 'No stack trace')}</code>\n\n` +
+        `⚠️ Browser forced to close. Process terminating.`;
+    logger.info('Sending CRITICAL error notification...');
     return sendTelegramMessage(message);
 }
 
@@ -107,5 +126,6 @@ module.exports = {
     sendTelegramMessage,
     notifySuccess,
     notifyAlreadyDownloaded,
-    notifyError
+    notifyError,
+    notifyCriticalError
 };

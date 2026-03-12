@@ -3,71 +3,100 @@ require('dotenv').config();
 const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs');
-const { initDatabase, wasRecentlyDownloaded, logDownload, closeDatabase } = require('./database');
+const { initDatabase, wasRecentlyDownloaded, logDownload, closeDatabase, startSession, endSession } = require('./database');
 const { notifySuccess, notifyAlreadyDownloaded, notifyError } = require('./notification');
+const { getAppLogger } = require('./logger');
+const { config, validateConfig } = require('./config');
 
-const AUTH_STATE_FILE = path.join(__dirname, 'auth.json');
-const DOWNLOADS_DIR = path.join(__dirname, 'downloads');
+const logger = getAppLogger();
 
-// Windows 10 User-Agent
-const WINDOWS_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// Validate configuration on startup
+validateConfig();
+
+const {
+    retryWithBackoff,
+    retryNavigation,
+    retryElementAction,
+    retryCreateContext,
+    retryLaunchBrowser,
+    retryDownload,
+    retryWaitFor,
+    retryScreenshot
+} = require('./retry-utils');
+
+const AUTH_STATE_FILE = config.paths.authStateFile;
+const DOWNLOADS_DIR = config.paths.downloadsDir;
+
+// Windows 10 User-Agent from config
+const WINDOWS_UA = config.browser.userAgent;
+
+// Retry configuration from config
+const RETRY_CONFIG = config.retry;
 
 async function downloadFlow() {
-    console.log('[DOWNLOAD FLOW] Starting download process...');
+    logger.info('Starting download process...', { module: 'DOWNLOAD_FLOW' });
 
     // Initialize database
     initDatabase();
 
+    // Start audit session
+    const sessionId = startSession();
+
     // Ensure downloads directory exists
     if (!fs.existsSync(DOWNLOADS_DIR)) {
         fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
-        console.log('[DOWNLOAD FLOW] Created downloads directory');
+        logger.info('Created downloads directory', { module: 'DOWNLOAD_FLOW' });
     }
 
     // Check if auth file exists
     if (!fs.existsSync(AUTH_STATE_FILE)) {
-        console.error('[DOWNLOAD FLOW] Session expired. Run npm start first to authenticate.');
+        logger.error('Session expired. Run npm start first to authenticate.', { module: 'DOWNLOAD_FLOW' });
+        endSession(sessionId, 'failed');
         closeDatabase();
         process.exit(1);
     }
 
-    console.log('[DOWNLOAD FLOW] Loading session from auth.json...');
+    logger.info('Loading session from auth.json...', { module: 'DOWNLOAD_FLOW' });
 
-    const browser = await chromium.launch({
-        headless: false,
-        args: ['--no-sandbox', '--disable-setuid-sandbox']
-    });
-
-    const context = await browser.newContext({
-        storageState: AUTH_STATE_FILE,
-        userAgent: WINDOWS_UA,
-        viewport: { width: 1920, height: 1080 },
-        acceptDownloads: true
-    });
-
-    const page = await context.newPage();
+    let browser;
+    let context;
+    let page;
 
     try {
+        browser = await retryLaunchBrowser({
+            headless: false,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        }, RETRY_CONFIG);
+
+        context = await retryCreateContext(browser, {
+            storageState: AUTH_STATE_FILE,
+            userAgent: WINDOWS_UA,
+            viewport: { width: 1920, height: 1080 },
+            acceptDownloads: true
+        }, RETRY_CONFIG);
+
+        page = await context.newPage();
+
         // Navigate to download page
-        console.log('[DOWNLOAD FLOW] Navigating to https://obsidian.md/download');
-        await page.goto('https://obsidian.md/download', { waitUntil: 'networkidle' });
+        logger.info('Navigating to https://obsidian.md/download', { module: 'DOWNLOAD_FLOW' });
+        await retryNavigation(page, 'https://obsidian.md/download', RETRY_CONFIG);
 
         // Check if session is valid (not redirected to login)
         const currentUrl = page.url();
         if (currentUrl.includes('/login') || currentUrl.includes('/auth')) {
-            console.error('[DOWNLOAD FLOW] Session expired. Run npm start first to re-authenticate.');
+            logger.warn('Session expired. Run npm start first to re-authenticate.', { module: 'DOWNLOAD_FLOW' });
             process.exit(1);
         }
 
-        console.log('[DOWNLOAD FLOW] Session validated, looking for download button...');
+        logger.info('Session validated, looking for download button...', { module: 'DOWNLOAD_FLOW' });
 
         // Debug: log page content
         const pageTitle = await page.title();
-        console.log(`[DOWNLOAD FLOW] Page title: ${pageTitle}`);
-        console.log(`[DOWNLOAD FLOW] Current URL: ${page.url()}`);
+        logger.info(`Page title: ${pageTitle}`, { module: 'DOWNLOAD_FLOW', url: page.url() });
+        logger.info(`Current URL: ${page.url()}`, { module: 'DOWNLOAD_FLOW' });
 
-        // Wait for page to fully load
-        await page.waitForLoadState('networkidle', { timeout: 30000 });
+        // Wait for page to fully load with HARD TIMEOUT
+        await retryWaitFor(page.locator('body'), { state: 'attached' }, { ...RETRY_CONFIG, timeout: RETRY_CONFIG.timeouts.selector });
 
         // Look for Windows download button - Obsidian typically has direct .exe links
         // Try multiple selector strategies
@@ -81,9 +110,9 @@ async function downloadFlow() {
             'a.button:has-text("Download")'
         ).first();
 
-        // Wait for download link to be visible
-        console.log('[DOWNLOAD FLOW] Waiting for download button to be visible...');
-        await downloadLink.waitFor({ state: 'visible', timeout: 30000 });
+        // Wait for download link to be visible with HARD TIMEOUT
+        logger.info('Waiting for download button to be visible...', { module: 'DOWNLOAD_FLOW' });
+        await retryWaitFor(downloadLink, { state: 'visible' }, { ...RETRY_CONFIG, timeout: RETRY_CONFIG.timeouts.selector });
 
         // Get the expected filename before clicking
         const href = await downloadLink.getAttribute('href');
@@ -93,73 +122,113 @@ async function downloadFlow() {
         if (wasRecentlyDownloaded(expectedFilename)) {
             const filePath = path.join(DOWNLOADS_DIR, expectedFilename);
             const fileExists = fs.existsSync(filePath);
-            
+
             if (fileExists) {
-                console.log(`[DOWNLOAD FLOW] SKIP: ${expectedFilename} was already downloaded successfully in the last 24 hours`);
+                logger.warn(`SKIP: ${expectedFilename} was already downloaded successfully in the last 24 hours`, { module: 'DOWNLOAD_FLOW' });
                 await notifyAlreadyDownloaded(expectedFilename);
+                endSession(sessionId, 'completed');
                 await browser.close();
                 closeDatabase();
                 return;
             } else {
-                console.log(`[DOWNLOAD FLOW] DB record exists but file missing: ${expectedFilename}. Proceeding with download...`);
+                logger.warn(`DB record exists but file missing: ${expectedFilename}. Proceeding with download...`, { module: 'DOWNLOAD_FLOW' });
             }
         }
 
-        console.log('[DOWNLOAD FLOW] Initiating download...');
-        
-        const [download] = await Promise.all([
-            page.waitForEvent('download', { timeout: 30000 }),
-            downloadLink.click()
-        ]);
+        logger.info('Initiating download...', { module: 'DOWNLOAD_FLOW' });
 
-        console.log('[DOWNLOAD FLOW] Download started...');
+        // Perform download with retry
+        const download = await retryDownload(page, downloadLink, RETRY_CONFIG);
+
+        logger.info('Download started...', { module: 'DOWNLOAD_FLOW' });
 
         // Get suggested filename
         const suggestedFilename = download.suggestedFilename() || 'obsidian-setup.exe';
         const savePath = path.join(DOWNLOADS_DIR, suggestedFilename);
 
-        console.log(`[DOWNLOAD FLOW] Saving to ${savePath}`);
+        logger.info(`Saving to ${savePath}`, { module: 'DOWNLOAD_FLOW' });
 
-        // Save the download
-        await download.saveAs(savePath);
+        // Save the download with retry
+        await retryWithBackoff(
+            async () => await download.saveAs(savePath),
+            { ...RETRY_CONFIG, operationName: 'Save download' }
+        );
 
-        console.log('[DOWNLOAD FLOW] Download completed successfully!');
-        console.log(`[DOWNLOAD FLOW] File saved: ${savePath}`);
+        logger.info('Download completed successfully!', { module: 'DOWNLOAD_FLOW' });
+        logger.info(`File saved: ${savePath}`, { module: 'DOWNLOAD_FLOW' });
 
-        // Log successful download
-        logDownload(suggestedFilename, 'success');
+        // Get file size
+        let fileSize = 0;
+        try {
+            const stats = fs.statSync(savePath);
+            fileSize = stats.size;
+            logger.info(`File size: ${fileSize} bytes`, { module: 'DOWNLOAD_FLOW' });
+        } catch (e) {
+            logger.warn(`Could not get file size: ${e.message}`, { module: 'DOWNLOAD_FLOW' });
+        }
+
+        // Log successful download with session and file size
+        logDownload(suggestedFilename, 'success', sessionId, fileSize);
+
+        // End session as completed
+        endSession(sessionId, 'completed');
 
         // Send Telegram notification
         await notifySuccess(suggestedFilename);
 
     } catch (error) {
-        console.error('[DOWNLOAD FLOW] Error:', error.message);
+        logger.error(`Error: ${error.message}`, { module: 'DOWNLOAD_FLOW' });
 
-        // Log failed download (try to get filename from error context)
+        // Log failed download
         try {
-            const href = await downloadLink.getAttribute('href');
-            const failedFilename = href ? path.basename(href) : 'unknown';
-            logDownload(failedFilename, 'failed');
+            if (page) {
+                const downloadLink = page.locator(
+                    'a[href*=".exe"], ' +
+                    'a[href*="win"], ' +
+                    'a[href*="windows"], ' +
+                    'a:has-text("Download for Windows"), ' +
+                    'a:has-text("Download Windows"), ' +
+                    'button:has-text("Download"), ' +
+                    'a.button:has-text("Download")'
+                ).first();
+                const href = await downloadLink.getAttribute('href');
+                const failedFilename = href ? path.basename(href) : 'unknown';
+                logDownload(failedFilename, 'failed', sessionId, 0);
+            } else {
+                logDownload('unknown', 'failed', sessionId, 0);
+            }
         } catch (e) {
-            logDownload('unknown', 'failed');
+            logDownload('unknown', 'failed', sessionId, 0);
         }
+
+        // End session as failed
+        endSession(sessionId, 'failed');
 
         // Send Telegram notification
         await notifyError(error.message);
 
-        // Take screenshot on error
-        const screenshotPath = path.join(__dirname, 'error-debug.png');
-        await page.screenshot({ path: screenshotPath, fullPage: true });
-        console.error(`[DOWNLOAD FLOW] Screenshot saved to ${screenshotPath}`);
+        // Take screenshot with retry
+        if (page) {
+            try {
+                const screenshotPath = path.join(__dirname, 'error-debug.png');
+                await retryScreenshot(page, { path: screenshotPath, fullPage: true }, RETRY_CONFIG);
+                logger.error(`Screenshot saved to ${screenshotPath}`, { module: 'DOWNLOAD_FLOW' });
+            } catch (screenshotError) {
+                logger.error('Failed to take error screenshot', { module: 'DOWNLOAD_FLOW', error: screenshotError.message });
+            }
+        }
 
         throw error;
     } finally {
-        await browser.close();
+        if (browser) {
+            await browser.close();
+        }
+        // Session already ended in success/error paths
         closeDatabase();
     }
 }
 
 downloadFlow().catch(err => {
-    console.error('[DOWNLOAD FLOW] Fatal error:', err);
+    logger.error(`Fatal error: ${err.message}`, { module: 'DOWNLOAD_FLOW' });
     process.exit(1);
 });

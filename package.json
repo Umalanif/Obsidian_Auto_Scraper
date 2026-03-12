@@ -5,22 +5,22 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
+    "scheduler": "node index.js --scheduler",
     "download": "node download-flow.js",
-    "history": "node download-history.js",
-    "cleanup": "node cleanup.js"
+    "history": "node download-history.js"
   },
   "keywords": [
     "playwright",
     "automation",
     "obsidian",
-    "download",
-    "qa"
+    "download"
   ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "better-sqlite3": "^12.6.2",
     "dotenv": "^16.3.1",
+    "node-cron": "^4.2.1",
     "playwright": "^1.40.0"
   },
   "type": "commonjs"
